@@ -50,55 +50,9 @@ fn test_full_flow() {
     svm.add_program(program_id, bytes).unwrap();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
 
-    let (whitelist_pda, _) = Pubkey::find_program_address(&[b"whitelist"], &program_id);
     let system_program_id = solana_program::system_program::id();
 
-    // Step 1: Initialize whitelist
-    let ix = Instruction::new_with_bytes(
-        program_id,
-        &program::instruction::InitializeWhitelist {}.data(),
-        program::accounts::InitializeWhitelist {
-            admin: payer.pubkey(),
-            whitelist: whitelist_pda,
-            system_program: system_program_id,
-        }
-        .to_account_metas(None),
-    );
-    send(&mut svm, &[ix], &payer, &[&payer]).expect("initialize_whitelist failed");
-
-    // Step 2: Add user (payer) to whitelist
-    let ix = Instruction::new_with_bytes(
-        program_id,
-        &program::instruction::AddToWhitelist {
-            user: payer.pubkey(),
-        }
-        .data(),
-        program::accounts::WhitelistOperations {
-            admin: payer.pubkey(),
-            whitelist: whitelist_pda,
-            system_program: system_program_id,
-        }
-        .to_account_metas(None),
-    );
-    send(&mut svm, &[ix], &payer, &[&payer]).expect("add_to_whitelist failed");
-
-    // Step 3: Remove user from whitelist
-    let ix = Instruction::new_with_bytes(
-        program_id,
-        &program::instruction::RemoveFromWhitelist {
-            user: payer.pubkey(),
-        }
-        .data(),
-        program::accounts::WhitelistOperations {
-            admin: payer.pubkey(),
-            whitelist: whitelist_pda,
-            system_program: system_program_id,
-        }
-        .to_account_metas(None),
-    );
-    send(&mut svm, &[ix], &payer, &[&payer]).expect("remove_from_whitelist failed");
-
-    // Step 4: Create mint with TransferHook extension
+    // Step 1: Create mint with TransferHook extension
     let mint = Keypair::new();
     let mint_size =
         ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::TransferHook]).unwrap();
@@ -129,7 +83,51 @@ fn test_full_flow() {
     )
     .expect("create mint with transfer hook failed");
 
-    // Step 5: Create source/destination ATAs and mint 100 tokens to source
+    // Whitelist PDA is now per mint + wallet
+    let (whitelist_pda, _) = Pubkey::find_program_address(
+        &[
+            b"whitelist",
+            mint.pubkey().as_ref(),
+            payer.pubkey().as_ref(),
+        ],
+        &program_id,
+    );
+
+    // Step 2: Add payer to whitelist
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &program::instruction::AddToWhitelist {
+            user: payer.pubkey(),
+        }
+        .data(),
+        program::accounts::AddToWhitelist {
+            admin: payer.pubkey(),
+            mint: mint.pubkey(),
+            whitelist: whitelist_pda,
+            system_program: system_program_id,
+        }
+        .to_account_metas(None),
+    );
+    send(&mut svm, &[ix], &payer, &[&payer]).expect("add_to_whitelist failed");
+
+    // Step 3: Remove payer from whitelist
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &program::instruction::RemoveFromWhitelist {
+            user: payer.pubkey(),
+        }
+        .data(),
+        program::accounts::RemoveFromWhitelist {
+            admin: payer.pubkey(),
+            mint: mint.pubkey(),
+            whitelist: whitelist_pda,
+            system_program: system_program_id,
+        }
+        .to_account_metas(None),
+    );
+    send(&mut svm, &[ix], &payer, &[&payer]).expect("remove_from_whitelist failed");
+
+    // Step 4: Create source/destination ATAs and mint tokens to source
     let source_ata = get_associated_token_address_with_program_id(
         &payer.pubkey(),
         &mint.pubkey(),
@@ -172,7 +170,7 @@ fn test_full_flow() {
     )
     .expect("create ATAs and mint_to failed");
 
-    // Step 6: Initialize ExtraAccountMetaList for the transfer hook
+    // Step 5: Initialize ExtraAccountMetaList
     let (extra_meta_pda, _) = Pubkey::find_program_address(
         &[b"extra-account-metas", mint.pubkey().as_ref()],
         &program_id,
@@ -192,45 +190,48 @@ fn test_full_flow() {
     send(&mut svm, &[ix], &payer, &[&payer]).expect("initialize_transfer_hook failed");
 
     let transfer_amount = 1u64 * 10u64.pow(9);
-    let build_transfer_ix = |source: &Keypair, mint_kp: &Keypair, src: Pubkey, dst: Pubkey| {
+
+    let build_transfer_ix = |authority: &Keypair, src: Pubkey, dst: Pubkey| {
         let mut ix = transfer_checked(
             &TOKEN_2022_ID,
             &src,
-            &mint_kp.pubkey(),
+            &mint.pubkey(),
             &dst,
-            &source.pubkey(),
+            &authority.pubkey(),
             &[],
             transfer_amount,
             9,
         )
         .unwrap();
-        // Order: extra_account_meta_list, then TLV-registered extras (whitelist), then hook program ID.
+
         ix.accounts
             .push(AccountMeta::new_readonly(extra_meta_pda, false));
         ix.accounts
-            .push(AccountMeta::new_readonly(whitelist_pda, false));
+            .push(AccountMeta::new_readonly(program_id, false)); // ← program id FIRST
         ix.accounts
-            .push(AccountMeta::new_readonly(program_id, false));
+            .push(AccountMeta::new_readonly(whitelist_pda, false)); // ← whitelist AFTER
+
         ix
     };
 
-    // Step 7a: Transfer should fail — payer was removed from the whitelist
-    let transfer_fail_ix = build_transfer_ix(&payer, &mint, source_ata, dest_ata);
+    // Step 6a: Transfer should fail because payer was removed from whitelist
+    let transfer_fail_ix = build_transfer_ix(&payer, source_ata, dest_ata);
     let res = send(&mut svm, &[transfer_fail_ix], &payer, &[&payer]);
     assert!(
         res.is_err(),
-        "transfer should fail — payer is not whitelisted"
+        "transfer should fail when payer is not whitelisted"
     );
 
-    // Step 7b: Re-add payer to whitelist, then the transfer should succeed
+    // Step 6b: Re-add payer to whitelist
     let ix = Instruction::new_with_bytes(
         program_id,
         &program::instruction::AddToWhitelist {
             user: payer.pubkey(),
         }
         .data(),
-        program::accounts::WhitelistOperations {
+        program::accounts::AddToWhitelist {
             admin: payer.pubkey(),
+            mint: mint.pubkey(),
             whitelist: whitelist_pda,
             system_program: system_program_id,
         }
@@ -238,7 +239,8 @@ fn test_full_flow() {
     );
     send(&mut svm, &[ix], &payer, &[&payer]).expect("re-add_to_whitelist failed");
 
-    let transfer_ok_ix = build_transfer_ix(&payer, &mint, source_ata, dest_ata);
+    // Step 6c: Transfer should now succeed
+    let transfer_ok_ix = build_transfer_ix(&payer, source_ata, dest_ata);
     send(&mut svm, &[transfer_ok_ix], &payer, &[&payer])
-        .expect("transfer should succeed — payer re-added to whitelist");
+        .expect("transfer should succeed when payer is whitelisted");
 }
